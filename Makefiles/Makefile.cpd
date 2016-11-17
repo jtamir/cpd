@@ -1,0 +1,3 @@
+MODULES_my_cpd = -lcpd
+MODULES_bart += -lcpd
+XTARGETS += cpd
