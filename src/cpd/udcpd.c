@@ -2,27 +2,71 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <complex.h>
 
-#ifdef MEX_COMPILE_FLAG
-#include <mex.h>
-#endif
 #include "misc.h"
 #include "udcpd.h"
+
+#include "misc/debug.h"
+#include "misc/misc.h"
+
+#include "num/multind.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-struct pattern_s *
+struct pattern_s{
+    int *masks;
+    int *maskTot;
+    long dims[KTDIMS];
+    long pat_strs[KTDIMS];
+    long nptsKT;
+    long nptsK;
+    long *numSamplest;
+    long numSamples;
+    int isPeriodicInK;
+};
+
+struct distanceCriteria{
+    /* min distance variables */
+    double dky_min;
+    double dt_min;
+    enum shape_opt shapeOpt;
+
+    double alpha;
+
+    /* options for relaxing min distance */
+    double dky_min_scale;
+    double dt_min_scale;
+    double dky_min_thresh;
+    double dt_min_thresh;
+    
+};
+
+struct samplingConstraints{
+    /* min distance */
+    struct distanceCriteria *dist;
+
+    /* max samples */
+    const long *maxSamplesPerPhase;
+    long maxTotalSamples;
+
+    /* defines k-space subdomain */
+    const int *feasiblePoints;
+};
+
+
+static struct pattern_s *
 init_data_str( const long *dims , const int isPeriodicInK)
 {
     struct pattern_s *data = (struct pattern_s *) xmalloc(sizeof(struct pattern_s));
     
-    memcpy(data->dims, dims, DIMS*sizeof(long));
+    memcpy(data->dims, dims, KTDIMS*sizeof(long));
     data->numSamples = 0;
-    data->nptsKT = md_calc_size(DIMS, data->dims);
+    data->nptsKT = md_calc_size(KTDIMS, data->dims);
     data->nptsK  = md_calc_size(KDIMS, data->dims);
-    md_calc_strides(DIMS, data->pat_strs, dims, 1);
+    md_calc_strides(KTDIMS, data->pat_strs, dims, 1);
     data->masks = xmalloc(data->nptsKT*sizeof(int)); 
     data->maskTot = xmalloc(data->nptsK*sizeof(int)); 
     
@@ -49,14 +93,15 @@ init_constraints(const long *maxSamplesPerPhase, const long maxTotalSamples,
 }
 
 static struct distanceCriteria*
-init_dst(const int shapeOpt, const double FOVRatio)
+init_dst(const int shapeOpt, const double alpha)
 {
     struct distanceCriteria *dist = (struct distanceCriteria *) xmalloc(sizeof(struct distanceCriteria));
+    //const long N = md_calc_size(KTDIMS, dims);
     
     /* initialize variables for min distance */
     dist->dky_min = 0;
     dist->dt_min  = 0;
-    dist->alpha = FOVRatio;
+    dist->alpha = alpha;
     dist->shapeOpt = shapeOpt;
 
     /* initialize options for relaxing min distance */
@@ -67,20 +112,23 @@ init_dst(const int shapeOpt, const double FOVRatio)
     return dist;
 }
 
-/* Multiply an ellipsoid by 0 */
+/* Zero out a region of the cpdf */
 static void
-zeroOutKTNeighborsf( double *cpdf, const long sample[],
-                  const struct distanceCriteria *dist, const long *dims, 
+zeroOutKTNeighborsf(double *cpdf, const long sample[],
+                  const struct distanceCriteria *dist, 
+                  const long *dims, 
                   const long *pat_strs,
                   const int isPeriodicInK){
    
-    long sampleInd = sub2ind(DIMS, pat_strs, sample);
+    long sampleInd = sub2ind(KTDIMS, sample, pat_strs);
+    if (sampleInd >= md_calc_size(3, dims))
+	    error("sampleInd out of bounds");
     cpdf[sampleInd] = 0;
     
     double dky_minsq = pow(dist->dky_min,2);
     /* zero out neighbors in k-t space */
     /* loop over a box covering the ellipsoid (max deltat, deltak) and decide to zero */
-    int ikt[DIMS];
+    int ikt[KTDIMS];
     for( ikt[Y_DIM] = 0 ; ikt[Y_DIM] < dist->dky_min ; ikt[Y_DIM]++  ){
         for( ikt[Z_DIM] = 0 ; ikt[Z_DIM] < dist->dky_min/dist->alpha ; ikt[Z_DIM]++ ){
             for( ikt[T_DIM] = 0 ; ikt[T_DIM] < dims[T_DIM]  ; ikt[T_DIM]++ ){
@@ -159,8 +207,8 @@ zeroOutKTNeighborsf( double *cpdf, const long sample[],
                             neighborSample[Z_DIM] = sample[Z_DIM] + zsgn*ikt[Z_DIM];
                             neighborSample[T_DIM] = sample[T_DIM] + tsgn*ikt[T_DIM];
                         }
-                        if( in_bounds(DIMS, neighborSample, dims) ){
-                            cpdf[sub2ind(DIMS, pat_strs, neighborSample)] = 0;
+                        if( in_bounds(KTDIMS, neighborSample, dims) ){
+                            cpdf[sub2ind(KTDIMS, neighborSample, pat_strs)] = 0;
                         }
                     }
                 }
@@ -169,17 +217,18 @@ zeroOutKTNeighborsf( double *cpdf, const long sample[],
     } /* end for y = 0 ; y < ... */
 }
 
-void
+static void
 addSamplesAtMinimumDistance( struct pattern_s *data, 
                              struct samplingConstraints *constraints){
     
-    long sample[DIMS];
+    long sample[KTDIMS];
     long N = data->nptsKT;
     long nptsK = data->nptsK;
+    long i;
 
     /* Initialize conditional PDF. Note: does not sum to 1 */
     double* cpdf = (double *) xmalloc(sizeof(double)*N);
-    for( long i = 0 ; i < N ; i++ )
+    for( i = 0 ; i < N ; i++ )
         cpdf[i] = 1;
     
     /* Condition on feasible points */
@@ -188,9 +237,9 @@ addSamplesAtMinimumDistance( struct pattern_s *data,
     }
     
     /* Condition on points satisfying minimum "distance" */
-    for( long i = 0 ; i < N ; i++ ){
+    for( i = 0 ; i < N ; i++ ){
         if( data->masks[i] ){
-            ind2sub(DIMS, data->dims, sample, i);
+            ind2sub(KTDIMS, data->dims, sample, i);
             zeroOutKTNeighborsf( cpdf, sample, constraints->dist, data->dims, 
                                   data->pat_strs, data->isPeriodicInK);
         }
@@ -199,25 +248,25 @@ addSamplesAtMinimumDistance( struct pattern_s *data,
     /* Set up random queue */
     long *randQ = xmalloc(N*sizeof(long));
     long lenRandQ = 0; /* length of the random queue */
-    for( long i = 0 ; i < N ; i++ ){
+    for( i = 0 ; i < N ; i++ ){
         if( cpdf[i] > 0 ){
             randQ[lenRandQ++] = i;
         }
     }
     if( lenRandQ == 0 ){
-        debug_printf("rand Q empty, breaking...\n");
+        debug_printf(DP_DEBUG1, "rand Q empty, breaking...\n");
         free(cpdf);
         return;
     }
     randperm(lenRandQ, randQ);
 
-    for( long i = 0 ; i < lenRandQ && data->numSamples < constraints->maxTotalSamples ; i++ ){
+    for( i = 0 ; i < lenRandQ && data->numSamples < constraints->maxTotalSamples ; i++ ){
         long sampleInd = randQ[i];
-        long sample[DIMS];
+        long sample[KTDIMS];
         if( sampleInd < 0 || sampleInd > N ){
-            my_assert(0, "sample out of range.");
+            error("sample out of range.");
         }
-        ind2sub(DIMS, data->dims, sample, sampleInd);
+        ind2sub(KTDIMS, data->dims, sample, sampleInd);
         if( data->numSamplest[sample[T_DIM]] < constraints->maxSamplesPerPhase[sample[T_DIM]] 
                 && data->numSamples < constraints->maxTotalSamples 
                 && cpdf[sampleInd] > 0 ){
@@ -261,24 +310,25 @@ relax_distance_constraints( struct distanceCriteria *dist)
 }
 
 void genUDCPD(const long *dims, 
-              int *pattern,
-                    const int *feasiblePoints, 
+              complex float *pattern_cfl, 
+              const int *feasiblePoints, 
               const double FOVRatio, 
               const double C, 
-              const long shapeOpt,
-              const double mindist_scale){
+              const long shapeOpt, 
+              const float initial_mindist){
     
     struct pattern_s *data = init_data_str(dims, 0);
+    long i;
 
     /* max samples per phase = ny*nz / # phases */
     long maxTotalSamples = (long) sumi(data->nptsK, feasiblePoints);
     long maxSamplesPerPhase[dims[T_DIM]];
-    for( long i = 0 ; i < dims[T_DIM] ; i++ ){
+    for( i = 0 ; i < dims[T_DIM] ; i++ ){
         maxSamplesPerPhase[i] = maxTotalSamples/dims[T_DIM];
     }
     /* + remainder */
     if( maxTotalSamples % dims[T_DIM]){
-        for( long i = 0 ; i <  maxTotalSamples % dims[T_DIM] ; i++ ){
+        for( i = 0 ; i <  maxTotalSamples % dims[T_DIM] ; i++ ){
             maxSamplesPerPhase[i]++;
         }
     }
@@ -286,46 +336,46 @@ void genUDCPD(const long *dims,
     /* Min "distance" options */
      
     /* Init min distance constraints */
-    debug_printf("------------- Uniform density CPD -------------\n");
-    debug_printf("FOVz/FOVy = %.2f, ", FOVRatio);
-    debug_printf("Dims: %d %d %d", dims[Y_DIM], dims[Z_DIM], dims[T_DIM]);
-    debug_printf("\nMin. distance criterion: ");
+    debug_printf(DP_DEBUG1, "------------- Uniform density CPD -------------\n");
+    debug_printf(DP_DEBUG1, "FOVz/FOVy = %.2f, ", FOVRatio);
+    debug_printf(DP_DEBUG1, "Dims: %ld %ld %ld", dims[Y_DIM], dims[Z_DIM], dims[T_DIM]);
+    debug_printf(DP_DEBUG1, "\nMin. distance criterion: ");
     switch( shapeOpt ){
         case CROSS:
         {
-            debug_printf("cross");
+            debug_printf(DP_DEBUG1, "cross");
             break;
         }
         case L2_BALL:
         {
-            debug_printf("ellipsoid");
+            debug_printf(DP_DEBUG1, "ellipsoid");
             break;
         }
         case L1_BALL:
         {
-            debug_printf("l1 ball");
+            debug_printf(DP_DEBUG1, "l1 ball");
             break;
         }
         case CONES:
         {
-            debug_printf("cones");
+            debug_printf(DP_DEBUG1, "cones");
             break;
         }
         default:
         {
-            my_assert(0, "Unrecognized min. distance criterion");
+            error("Unrecognized min. distance criterion");
         }
     }
-    debug_printf("\nMax total samples = %d", maxTotalSamples);
-    debug_printf("\nMax # samples per phase: ");
+    debug_printf(DP_DEBUG1, "\nMax total samples = %ld", maxTotalSamples);
+    debug_printf(DP_DEBUG1, "\nMax # samples per phase: ");
 
-    for( long i = 0 ; i < dims[T_DIM] ; i++ ){
-        debug_printf("%d ", maxSamplesPerPhase[i]);
+    for( i = 0 ; i < dims[T_DIM] ; i++ ){
+        debug_printf(DP_DEBUG1, "%ld ", maxSamplesPerPhase[i]);
     }
-    debug_printf("\n-----------------------------------------------\n");
+    debug_printf(DP_DEBUG1, "\n-----------------------------------------------\n");
     struct samplingConstraints *constraints = init_constraints(maxSamplesPerPhase, maxTotalSamples, feasiblePoints);
     constraints->dist = init_dst(shapeOpt, FOVRatio);
-    constraints->dist->dky_min = 100*(mindist_scale+0.001)*sqrt(MIN( (0.5f*FOVRatio) / maxSamplesPerPhase[0], MIN(9*pow(FOVRatio,3), 9.0f ) ));
+    constraints->dist->dky_min = initial_mindist*sqrt(MIN( (0.5f) / maxSamplesPerPhase[0], 9));
     constraints->dist->dt_min  = C*constraints->dist->dky_min;
 
 
@@ -333,20 +383,23 @@ void genUDCPD(const long *dims,
     while( data->numSamples < constraints->maxTotalSamples ){
         addSamplesAtMinimumDistance(data, constraints);
         iter++;
-        debug_printf("It: %2d, # Samples: %7d, ky min. dist.: %.1f\n", iter, 
+        debug_printf(DP_DEBUG1, "It: %2d, # Samples: %7ld, ky min. dist.: %.1f\n", iter, 
                      data->numSamples, constraints->dist->dky_min); 
-
-        if( data->numSamples < constraints->maxTotalSamples && !relax_distance_constraints( constraints->dist ) ){
-            debug_printf("WARNING: could not fill sampling pattern...\n");
+        if( !relax_distance_constraints( constraints->dist ) ){
+            debug_printf(DP_DEBUG1, "WARNING: could not fill sampling pattern...\n");
             break;
         }
     }
     
-    for( long i = 0 ; i < data->nptsKT ; i++ ){
-        pattern[i] = data->masks[i];
+    debug_printf(DP_DEBUG1, "Copy....\n");
+    for( i = 0 ; i < data->nptsKT ; i++ ){
+        pattern_cfl[i] = data->masks[i];
     }
+    debug_printf(DP_DEBUG1, "Done.\n");
     
     free(data->masks);
+    free(data->numSamplest);
+    free(data->maskTot);
 }
 
 #ifdef __cplusplus
